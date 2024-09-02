@@ -1,8 +1,37 @@
 from dataclasses import dataclass
+import inspect
 import math
+from typing import Callable
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
+import time
+import tiktoken
+
+# torch.set_float32_matmul_precision("high")
+
+encoder = tiktoken.get_encoding("gpt2")
+
+# GPT-3 uses 0.5M tokens in a total batch.
+# This represents the total number of tokens to be processed before an optimizer step, not the number of data rows.
+# We accumulate gradients over mini-batches and only update the model weights once we've processed total_batch_size tokens.
+total_batch_size = 256
+B, T = 4, 32
+assert (
+    total_batch_size % (B * T) == 0
+), "total_batch_size should be divisible by (B * T)."
+
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"gradient accumulation steps: {grad_accum_steps}")
+
+warm_up_steps = 15
+max_lr = 3e-4
+min_lr = max_lr * 0.1
+max_steps = 50
+device = "cuda" if torch.cuda.is_available() else "cpu"
+device_type = "cuda" if device.startswith("cuda") else "cpu"
+use_compile = True
 
 
 @dataclass
@@ -28,14 +57,7 @@ class CausalAttention(nn.Module):
         )  # All q,k,v in single matrix for efficiency
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
 
-        self.c_proj.RESIDUAL_SCALE_INIT = 1
-
-        self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                1, 1, config.block_size, config.block_size
-            ),
-        )
+        self.c_proj.RESIDUAL_SCALE_INIT = 1  # type: ignore
 
     def forward(self, x):
         B, T, C = x.shape
@@ -48,12 +70,7 @@ class CausalAttention(nn.Module):
         k = k.view(B, T, self.n_head, hs).transpose(1, 2)  # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, hs).transpose(1, 2)  # (B, nh, T, hs)
 
-        att = (q @ k.transpose(-2, -1)) * (
-            1 / math.sqrt(hs)
-        )  #  (B, nh, T, hs) @ ((B, nh, hs, T)) -> (B, nh, T, T)
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # flash attention
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
@@ -66,7 +83,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.RESIDUAL_SCALE_INIT = 1
+        self.c_proj.RESIDUAL_SCALE_INIT = 1  # type: ignore
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -211,44 +228,171 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, lr, device_type):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        decay_params, no_decay_params = [], []
+        for _, p in param_dict.items():
+            if p.dim() >= 2:
+                decay_params.append(p)
+            else:
+                no_decay_params.append(p)
+
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_no_decay_params = sum(p.numel() for p in no_decay_params)
+
+        print(
+            f"number of decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+        )
+        print(
+            f"number of non-decayed parameter tensors: {len(no_decay_params)}, with {num_no_decay_params:,} parameters"
+        )
+
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters  # type: ignore
+        use_fused = fused_available and device_type == "cuda"
+        print(f"using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)  # type: ignore
+        return optimizer
+
 
 # =============================================================================
 
 
-model = GPT.from_pretrained("gpt2")
-print("GPT-2 pretrained model loaded successfully")
+class DataLoaderLite:
+    def __init__(self, B, T, data):
+        self.B = B
+        self.T = T
+        self.tokens = torch.tensor(encoder.encode(data))
+        print(f"length of tokens: {len(self.tokens)}")
+        print(f"batches per epoch: {len(self.tokens)//(B*T)}")
+
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        end_position = self.current_position + (B * T)
+
+        batch = self.tokens[self.current_position : end_position + 1]
+        x = batch[:-1].view(B, T)
+        y = batch[1:].view(B, T)
+
+        if end_position + 1 > len(self.tokens):
+            self.current_position = 0
+        else:
+            self.current_position = end_position
+
+        return x, y
 
 
-model.eval()
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
+def train_model(
+    model: GPT,
+    optimizer: torch.optim.Optimizer,  # type: ignore
+    train_loader: DataLoaderLite,
+    lr_scheduler: Callable,
+    max_steps: int,
+    grad_accum_steps: int,
+):
+    t0 = time.time()
+    for step in range(max_steps):
+        optimizer.zero_grad()
+        loss_accum = 0.0
+
+        for grad_step in range(grad_accum_steps):
+            start = time.time()
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+
+            # with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            # autocasting to bfloat16 on T4 is reducing the performance
+            logits, loss = model(x, y)
+
+            loss = loss / grad_accum_steps
+            # Adjust the loss to account for gradient accumulation.
+            # Instead of back propagating the full loss after each batch, we divide by the number of accumulation steps.
+            # This ensures that the gradients are averaged over multiple batches, simulating a larger batch size.
+
+            loss_accum += loss.detach()  # Detach tensor for loss tracking calculations
+            loss.backward()
+
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+        lr = lr_scheduler(step)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
+        optimizer.step()
+        if device == "cuda":
+            torch.cuda.synchronize()
+
+        duration = time.time() - start
+        tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps) / duration
+
+        print(
+            f"Step {step}| loss: {loss_accum:.6f}  | norm: {norm:.4f}  | time_taken(ms): {duration*1000:.2f}  | rate: {tokens_per_sec:.2f}tokens/sec"
+        )
+    print(f"total_time: {time.time()-t0}")
+
+
+def get_lr(step):
+    if step < warm_up_steps:
+        return max_lr * ((step + 1) / warm_up_steps)  # step + 1 to skip lr=0 at step=0
+    elif step > max_steps:
+        return min_lr
+
+    decay_ratio = (step - warm_up_steps) / (max_steps - warm_up_steps)
+    assert 0 <= decay_ratio <= 1
+    scale = 0.5 * (1 + math.cos(decay_ratio * math.pi))  # 1 -> 0
+
+    return (scale * (max_lr - min_lr)) + min_lr
+
+
+# ===========================================================================
+
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+if use_compile:
+    torch.compile(model)
 
-num_return_sequences = 5
-max_length = 30
+with open("input.txt", "r") as f:
+    text = f.read()
 
-import tiktoken
 
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = torch.tensor(tokens, dtype=torch.long)
-tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to(device)
+train_loader = DataLoaderLite(B, T, text)
 
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+optimizer = model.configure_optimizers(weight_decay=0.1, lr=max_lr, device=device)  # type: ignore
 
-while x.shape[1] < max_length:
-    with torch.no_grad():
-        logits = model(x)  # (B,T,n_embd)
-        logits = logits[:, -1, :]
-        probs = F.softmax(logits, dim=-1)
-        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-        ix = torch.multinomial(topk_probs, num_samples=1)
-        idx = torch.gather(topk_indices, -1, ix)
-        x = torch.cat((x, idx), dim=1)
+train_model(model, optimizer, train_loader, get_lr, max_steps=20, grad_accum_steps=2)
 
-for i in range(num_return_sequences):
-    decoded = enc.decode(x[i].tolist())
-    print(f"> {decoded}")
+
+# =============================================================================
+
+
+# model.eval()
+
+
+# num_return_sequences = 5
+# max_length = 30
+
+# tokens = encoder.encode("Hello,")
+# tokens = torch.tensor(tokens, dtype=torch.long)
+# tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+# x = tokens.to(device)
+
+# torch.manual_seed(42)
+# torch.cuda.manual_seed(42)
+
+# while x.shape[1] < max_length:
+#     with torch.no_grad():
+#         logits, loss = model(x)  # (B,T,n_embd)
+#         logits = logits[:, -1, :]
+#         probs = F.softmax(logits, dim=-1)
+#         topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+#         ix = torch.multinomial(topk_probs, num_samples=1)
+#         idx = torch.gather(topk_indices, -1, ix)
+#         x = torch.cat((x, idx), dim=1)
+
+# for i in range(num_return_sequences):
+#     decoded = encoder.decode(x[i].tolist())
+#     print(f"> {decoded}")
